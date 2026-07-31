@@ -58,8 +58,8 @@ from sqlalchemy.orm import (
 )
 
 # ── Cấu hình Shop ──────────────────────────────────────────────────────────────
-ACCOUNT_PRICE = 300  # VNĐ mỗi acc
-MIN_ORDER_QTY = 50  # Số lượng tối thiểu
+ACCOUNT_PRICE = 350  # VNĐ mỗi acc
+MIN_ORDER_QTY = 1  # Số lượng tối thiểu
 CHECKER_LINK = "t.me/tretrauchecker_bot?start=_tgr_8UulJtkyZjE1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
