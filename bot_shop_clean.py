@@ -81,6 +81,14 @@ HEARTBEAT_INTERVAL_SEC = 60
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1.5
 
+# ── Cấu hình Thanh Toán Tự Động (SePay) ──────────────────────────────────────
+# Đăng ký & liên kết tài khoản ngân hàng tại https://my.sepay.vn, lấy API Key ở menu Tích hợp Webhooks.
+SEPAY_API_KEY = os.environ.get("SEPAY_API_KEY", "")          # API Key cấu hình xác thực webhook bên SePay
+SEPAY_BANK_ACCOUNT = os.environ.get("SEPAY_BANK_ACCOUNT", "")  # Số tài khoản MB Bank nhận tiền
+SEPAY_BANK_CODE = os.environ.get("SEPAY_BANK_CODE", "MBBank")  # Mã ngân hàng dùng để tạo QR VietQR (SePay quy ước)
+DEPOSIT_CODE_PREFIX = "NAP"   # Tiền tố mã nạp tiền, khách phải ghi đúng vào nội dung chuyển khoản
+DEPOSIT_EXPIRE_MINUTES = 30   # Phút hết hạn của 1 yêu cầu nạp tiền tự động chưa thanh toán
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
@@ -195,6 +203,10 @@ class Deposit(Base):
     admin_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # ── Cột mới phục vụ thanh toán tự động qua SePay Webhook ──
+    code: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)          # Mã nội dung CK, vd NAP000123
+    sepay_txn_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)  # ID giao dịch SePay, chống xử lý trùng
+    auto_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)      # True nếu được duyệt tự động qua webhook
     user: Mapped["User"] = relationship("User", back_populates="deposits")
 
 class GiftCode(Base):
@@ -267,6 +279,19 @@ async def init_db() -> None:
             pass
         try:
             await conn.execute(sa_text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_checkin_date VARCHAR(10)"))
+        except Exception:
+            pass
+        # Migration: cột mới trên bảng deposits cho thanh toán tự động SePay
+        try:
+            await conn.execute(sa_text("ALTER TABLE deposits ADD COLUMN IF NOT EXISTS code VARCHAR(32)"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(sa_text("ALTER TABLE deposits ADD COLUMN IF NOT EXISTS sepay_txn_id VARCHAR(64)"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(sa_text("ALTER TABLE deposits ADD COLUMN IF NOT EXISTS auto_confirmed BOOLEAN NOT NULL DEFAULT FALSE"))
         except Exception:
             pass
     logger.info("Database initialized")
@@ -562,6 +587,8 @@ async def get_all_orders(session, limit=50):
 async def create_deposit(session, user_id, amount, bill_image=None):
     dep = Deposit(user_id=user_id, amount=amount, bill_image=bill_image, status=DepositStatus.pending)
     session.add(dep)
+    await session.flush()  # cần dep.id trước khi sinh mã
+    dep.code = f"{DEPOSIT_CODE_PREFIX}{dep.id:06d}"
     await session.commit()
     await session.refresh(dep)
     return dep
@@ -569,6 +596,36 @@ async def create_deposit(session, user_id, amount, bill_image=None):
 async def get_deposit_by_id(session, deposit_id):
     r = await session.execute(select(Deposit).options(selectinload(Deposit.user)).where(Deposit.id == deposit_id))
     return r.scalar_one_or_none()
+
+async def get_pending_deposit_by_code(session, code):
+    """Tìm yêu cầu nạp tiền đang chờ khớp với mã trong nội dung chuyển khoản (dùng cho webhook tự động)."""
+    r = await session.execute(
+        select(Deposit).options(selectinload(Deposit.user))
+        .where(Deposit.status == DepositStatus.pending, Deposit.code == code)
+        .order_by(Deposit.created_at.desc())
+    )
+    return r.scalar_one_or_none()
+
+def build_vietqr_url(amount, content):
+    """Sinh URL ảnh QR VietQR động qua SePay — không cần admin upload QR thủ công."""
+    from urllib.parse import quote
+    return (
+        f"https://qr.sepay.vn/img?acc={SEPAY_BANK_ACCOUNT}&bank={SEPAY_BANK_CODE}"
+        f"&amount={amount}&des={quote(content)}"
+    )
+
+async def auto_confirm_deposit(session, deposit_id, sepay_txn_id):
+    """Duyệt tự động một yêu cầu nạp tiền khi webhook SePay khớp mã & số tiền."""
+    dep = await get_deposit_by_id(session, deposit_id)
+    if dep is None or dep.status != DepositStatus.pending:
+        return None
+    dep.status = DepositStatus.approved
+    dep.approved_at = datetime.utcnow()
+    dep.auto_confirmed = True
+    dep.sepay_txn_id = str(sepay_txn_id)
+    await session.commit()
+    await session.refresh(dep)
+    return dep
 
 async def approve_deposit(session, deposit_id, admin_tg_id):
     dep = await get_deposit_by_id(session, deposit_id)
@@ -593,6 +650,7 @@ async def reject_deposit(session, deposit_id, admin_tg_id):
 async def get_pending_deposits(session):
     r = await session.execute(select(Deposit).options(selectinload(Deposit.user)).where(Deposit.status == DepositStatus.pending).order_by(Deposit.created_at.asc()))
     return list(r.scalars().all())
+
 
 # ── Điểm thưởng / Điểm danh / Hạng thành viên ────────────────────────────────
 def get_membership_tier(total_spent: int) -> str:
@@ -1223,17 +1281,16 @@ async def my_orders(message: Message, state: FSMContext, db_user: User, db_sessi
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 # ── Nạp tiền VNĐ ──────────────────────────────────────────────────────────────
+def sepay_enabled() -> bool:
+    return bool(SEPAY_API_KEY and SEPAY_BANK_ACCOUNT)
+
 @router.message(lambda m: m.text == "💳 Nạp Tiền")
 async def deposit_start(message: Message, state: FSMContext):
     await state.clear()
-    if not qr_exists():
+    if not sepay_enabled() and not qr_exists():
         await message.answer("⚠️ Hệ thống nạp tiền đang bảo trì (Thiếu QR). Vui lòng liên hệ Admin.")
         return
-    await message.answer_photo(
-        FSInputFile(QR_IMAGE_PATH),
-        caption="💳 <b>Nạp Tiền Qua QR</b>\n\nQuét mã QR để chuyển khoản tiền thật.\n\nNhập số tiền muốn nạp (VNĐ):",
-        parse_mode="HTML", reply_markup=cancel_kb()
-    )
+    await message.answer("💳 <b>Nạp Tiền</b>\n\nNhập số tiền muốn nạp (VNĐ):", parse_mode="HTML", reply_markup=cancel_kb())
     await state.set_state(DepositState.waiting_amount)
 
 @router.message(DepositState.waiting_amount, F.text == "❌ Hủy")
@@ -1242,14 +1299,41 @@ async def deposit_cancel_amount(message: Message, state: FSMContext):
     await message.answer("❌ Đã hủy nạp tiền.", reply_markup=main_menu_kb())
 
 @router.message(DepositState.waiting_amount, ~F.text.in_(MENU_BUTTONS))
-async def deposit_amount(message: Message, state: FSMContext):
+async def deposit_amount(message: Message, state: FSMContext, db_user: User, db_session):
     text = (message.text or "").replace(",", "").replace(".", "").strip()
     if not text.isdigit() or int(text) <= 0:
         await message.answer("⚠️ Vui lòng nhập số tiền hợp lệ.")
         return
     amount = int(text)
+
+    if sepay_enabled():
+        # ── Luồng thanh toán TỰ ĐỘNG qua SePay: tạo yêu cầu nạp trước để có mã nội dung CK ──
+        deposit = await create_deposit(db_session, db_user.id, amount)
+        qr_url = build_vietqr_url(amount, deposit.code)
+        await state.update_data(deposit_id=deposit.id, amount=amount)
+        await message.answer_photo(
+            qr_url,
+            caption=(
+                f"💳 <b>Quét QR Để Nạp Tiền Tự Động</b>\n\n"
+                f"💵 Số tiền: <b>{amount:,} VNĐ</b>\n"
+                f"📝 Nội dung CK (bắt buộc đúng): <code>{deposit.code}</code>\n"
+                f"⏰ Hiệu lực: <b>{DEPOSIT_EXPIRE_MINUTES} phút</b>\n\n"
+                f"⚡️ Hệ thống sẽ <b>tự động cộng tiền trong vài giây</b> sau khi bạn chuyển khoản đúng nội dung — "
+                f"không cần gửi bill hay chờ Admin duyệt.\n\n"
+                f"⚠️ Nếu chuyển sai nội dung, vui lòng gửi ảnh bill tại đây để Admin đối soát thủ công."
+            ),
+            parse_mode="HTML", reply_markup=main_menu_kb()
+        )
+        await state.set_state(DepositState.waiting_bill)
+        return
+
+    # ── Luồng THỦ CÔNG (khi chưa cấu hình SePay): giữ nguyên như bản cũ ──
     await state.update_data(amount=amount)
-    await message.answer(f"💵 Số tiền nạp: <b>{amount:,} VNĐ</b>\n\n📷 Vui lòng gửi ảnh chụp màn hình bill chuyển khoản:", parse_mode="HTML", reply_markup=cancel_kb())
+    await message.answer_photo(
+        FSInputFile(QR_IMAGE_PATH),
+        caption=f"💵 Số tiền nạp: <b>{amount:,} VNĐ</b>\n\n📷 Vui lòng gửi ảnh chụp màn hình bill chuyển khoản:",
+        parse_mode="HTML", reply_markup=cancel_kb()
+    )
     await state.set_state(DepositState.waiting_bill)
 
 @router.message(DepositState.waiting_bill, F.text == "❌ Hủy")
@@ -1261,23 +1345,35 @@ async def deposit_cancel_bill(message: Message, state: FSMContext):
 async def deposit_bill_photo(message: Message, state: FSMContext, bot: Bot, db_user: User, db_session):
     data = await state.get_data()
     amount = data.get("amount", 0)
+    existing_deposit_id = data.get("deposit_id")
     await state.clear()
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     file_bytes = await bot.download_file(file.file_path)
     bill_path = await save_bill_image(file_bytes.read(), "jpg")
 
-    deposit = await create_deposit(db_session, db_user.id, amount, bill_path)
+    if existing_deposit_id:
+        # Yêu cầu nạp tự động đã tồn tại (từ luồng SePay) — chỉ đính kèm ảnh bill để Admin đối soát nếu cần
+        deposit = await get_deposit_by_id(db_session, existing_deposit_id)
+        if deposit is None or deposit.status != DepositStatus.pending:
+            await message.answer("✅ Giao dịch của bạn đã được xử lý (có thể đã tự động cộng tiền trước đó).", reply_markup=main_menu_kb())
+            return
+        deposit.bill_image = bill_path
+        await db_session.commit()
+    else:
+        deposit = await create_deposit(db_session, db_user.id, amount, bill_path)
+
     uname = f"@{db_user.username}" if db_user.username else "Không có"
     now_str = datetime.utcnow().strftime("%d/%m/%Y %H:%M:%S")
     caption = (
-        f"💳 <b>YÊU CẦU NẠP TIỀN</b>\n\n"
+        f"💳 <b>YÊU CẦU NẠP TIỀN (cần đối soát thủ công)</b>\n\n"
         f"🆔 ID Telegram: <code>{db_user.telegram_id}</code>\n"
         f"👤 Username: {uname}\n"
         f"📛 Tên: {db_user.fullname}\n"
-        f"💵 Số tiền: <b>{amount:,} VNĐ</b>\n"
+        f"💵 Số tiền: <b>{deposit.amount:,} VNĐ</b>\n"
         f"🕐 Thời gian: {now_str}\n"
         f"🧾 Mã Bill nạp: #{deposit.id}"
+        + (f" — Nội dung CK: <code>{deposit.code}</code>" if deposit.code else "")
     )
     kb = deposit_approval_kb(deposit.id)
     for admin_id in ADMIN_IDS:
@@ -1684,17 +1780,101 @@ async def handle_health(request):
 async def handle_app(request):
     return web.json_response({"app": "Shop Garena Premium Bot", "status": "running"})
 
-async def start_web_server():
+async def handle_sepay_webhook(request):
+    """Nhận webhook biến động số dư từ SePay và tự động cộng tiền khi khớp mã nạp tiền."""
+    if SEPAY_API_KEY:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Apikey {SEPAY_API_KEY}":
+            logger.warning("⚠️ Webhook SePay bị từ chối: sai API Key")
+            return web.json_response({"success": False, "message": "unauthorized"}, status=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"success": False, "message": "invalid json"}, status=400)
+
+    txn_id = str(payload.get("id", ""))
+    transfer_type = payload.get("transferType", "in")
+    amount = int(payload.get("transferAmount", 0) or 0)
+    content = f"{payload.get('content') or ''} {payload.get('code') or ''}".upper()
+
+    if transfer_type != "in" or amount <= 0 or not txn_id:
+        return web.json_response({"success": True, "message": "ignored"}, status=200)
+
+    bot: Bot = request.app["bot"]
+    async with AsyncSessionLocal() as session:
+        # Chống xử lý trùng nếu SePay gửi lại webhook (retry)
+        r = await session.execute(select(Deposit).where(Deposit.sepay_txn_id == txn_id))
+        if r.scalar_one_or_none() is not None:
+            return web.json_response({"success": True, "message": "duplicate, skipped"}, status=200)
+
+        matched_code = None
+        for token in content.split():
+            if token.startswith(DEPOSIT_CODE_PREFIX):
+                matched_code = token
+                break
+        if matched_code is None:
+            logger.info("ℹ️ Webhook SePay không tìm thấy mã nạp tiền hợp lệ trong nội dung: %s", content)
+            return web.json_response({"success": True, "message": "no matching code"}, status=200)
+
+        deposit = await get_pending_deposit_by_code(session, matched_code)
+        if deposit is None:
+            logger.info("ℹ️ Webhook SePay: không tìm thấy đơn nạp đang chờ với mã %s", matched_code)
+            return web.json_response({"success": True, "message": "no pending deposit"}, status=200)
+        if amount < deposit.amount:
+            logger.warning("⚠️ Webhook SePay: số tiền chuyển (%s) ít hơn yêu cầu (%s) cho mã %s", amount, deposit.amount, matched_code)
+            return web.json_response({"success": True, "message": "amount mismatch"}, status=200)
+
+        confirmed = await auto_confirm_deposit(session, deposit.id, txn_id)
+        if confirmed is None:
+            return web.json_response({"success": True, "message": "already processed"}, status=200)
+
+        user_after = await add_balance(session, confirmed.user_id, confirmed.amount)
+        user_tg_id = confirmed.user.telegram_id if confirmed.user else None
+        if user_tg_id:
+            try:
+                await bot.send_message(
+                    user_tg_id,
+                    f"✅ <b>Nạp tiền tự động thành công!</b>\n\n"
+                    f"💵 Cộng: <b>{confirmed.amount:,} VNĐ</b>\n"
+                    f"💰 Số dư ví VNĐ: <b>{user_after.balance:,} VNĐ</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        if user_after is not None:
+            await maybe_reward_referrer(session, bot, user_after, confirmed.amount)
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚡️ <b>Nạp tiền TỰ ĐỘNG</b> — Mã {matched_code}\n"
+                    f"👤 {confirmed.user.fullname if confirmed.user else user_tg_id}\n"
+                    f"💵 {confirmed.amount:,} VNĐ",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    return web.json_response({"success": True, "message": "confirmed"}, status=200)
+
+async def start_web_server(bot: Bot):
     app = web.Application()
+    app["bot"] = bot
     app.router.add_get("/", handle_web)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/app", handle_app)
+    app.router.add_post("/sepay-webhook", handle_sepay_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"✅ Web Server Keep-Alive đang kích hoạt tại Port: {port}")
+    if sepay_enabled():
+        logger.info("⚡️ Webhook thanh toán tự động SePay: sẵn sàng tại /sepay-webhook")
+    else:
+        logger.info("ℹ️ Chưa cấu hình SEPAY_API_KEY/SEPAY_BANK_ACCOUNT — nạp tiền dùng luồng thủ công.")
 
 async def heartbeat_task():
     """Cập nhật heartbeat định kỳ để endpoint /health phản ánh đúng trạng thái bot."""
@@ -1742,14 +1922,15 @@ async def main():
         sys.exit(1)
 
     await init_db()
-    await start_web_server()
-    asyncio.create_task(heartbeat_task())
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
     dp.include_router(router)
+
+    await start_web_server(bot)
+    asyncio.create_task(heartbeat_task())
 
     logger.info("🤖 Bot Shop Đã Sẵn Sàng Trực Tuyến!")
     try:
