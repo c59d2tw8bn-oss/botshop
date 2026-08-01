@@ -1290,7 +1290,7 @@ async def deposit_start(message: Message, state: FSMContext):
     if not sepay_enabled() and not qr_exists():
         await message.answer("⚠️ Hệ thống nạp tiền đang bảo trì (Thiếu QR). Vui lòng liên hệ Admin.")
         return
-    await message.answer("💳 <b>Nạp Tiền</b>\n\nNhập số tiền muốn nạp (VNĐ):", parse_mode="HTML", reply_markup=cancel_kb())
+    await message.answer("💳 <b>Nạp Tiền</b>\n\nNhập số tiền muốn nạp (tối thiểu 10,000VNĐ):", parse_mode="HTML", reply_markup=cancel_kb())
     await state.set_state(DepositState.waiting_amount)
 
 @router.message(DepositState.waiting_amount, F.text == "❌ Hủy")
