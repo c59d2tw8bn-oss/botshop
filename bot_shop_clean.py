@@ -62,7 +62,7 @@ from sqlalchemy.orm import (
 # ── Cấu hình Shop ──────────────────────────────────────────────────────────────
 ACCOUNT_PRICE = 350  # VNĐ mỗi acc
 MIN_ORDER_QTY = 1  # Số lượng tối thiểu
-CHECKER_LINK = "t.me/tretrauchecker_bot?start=_tgr_8UulJtkyZjE1"
+CHECKER_LINK = "https://t.me/tretrauchecker_bot?start=ref_7936179657"
 
 # ── Cấu hình tính năng Premium ───────────────────────────────────────────────
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "")  # dùng để tạo link giới thiệu, vd: MyShopBot
