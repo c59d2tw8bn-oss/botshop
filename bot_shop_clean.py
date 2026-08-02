@@ -72,7 +72,7 @@ CHECKIN_STREAK_BONUS = 100    # điểm cộng thêm mỗi ngày giữ streak (t
 REFERRAL_REWARD = 3000        # VNĐ thưởng cho người mời khi giới thiệu nạp tiền lần đầu
 REFERRAL_MIN_DEPOSIT = 20000  # Số tiền nạp tối thiểu lần đầu để tính thưởng giới thiệu
 POINTS_PER_VND_SPENT = 1      # số điểm nhận được trên mỗi 1.000 VNĐ chi tiêu (mua acc)
-POINTS_TO_VND_RATE = 1        # 1 điểm = 1 VNĐ khi đổi điểm lấy tiền
+POINTS_TO_VND_RATE = 1        # 100 điểm = 1 VNĐ khi đổi điểm lấy tiền
 MIN_POINTS_REDEEM = 1000      # số điểm tối thiểu để đổi ra tiền
 MEMBERSHIP_TIERS = [
     # (ngưỡng tổng tiền đã mua, tên hạng, % giảm giá khi mua acc)
