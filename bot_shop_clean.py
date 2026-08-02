@@ -16,6 +16,7 @@ import re as _re
 import secrets
 import string
 import sys
+import time
 import uuid
 import random
 from datetime import datetime, timedelta
@@ -71,12 +72,21 @@ CHECKIN_STREAK_BONUS = 100    # điểm cộng thêm mỗi ngày giữ streak (t
 REFERRAL_REWARD = 3000        # VNĐ thưởng cho người mời khi giới thiệu nạp tiền lần đầu
 REFERRAL_MIN_DEPOSIT = 20000  # Số tiền nạp tối thiểu lần đầu để tính thưởng giới thiệu
 POINTS_PER_VND_SPENT = 1      # số điểm nhận được trên mỗi 1.000 VNĐ chi tiêu (mua acc)
+POINTS_TO_VND_RATE = 1        # 1 điểm = 1 VNĐ khi đổi điểm lấy tiền
+MIN_POINTS_REDEEM = 1000      # số điểm tối thiểu để đổi ra tiền
 MEMBERSHIP_TIERS = [
-    (0, "🥉 Đồng"),
-    (200_000, "🥈 Bạc"),
-    (1_000_000, "🥇 Vàng"),
-    (5_000_000, "💎 Kim Cương"),
+    # (ngưỡng tổng tiền đã mua, tên hạng, % giảm giá khi mua acc)
+    (0, "🥉 Đồng", 0),
+    (200_000, "🥈 Bạc", 3),
+    (1_000_000, "🥇 Vàng", 5),
+    (5_000_000, "💎 Kim Cương", 8),
 ]
+MIN_WITHDRAW_COMMISSION = 50_000   # Số dư hoa hồng tối thiểu để được rút
+MIN_DEPOSIT_AMOUNT = 10_000        # Số tiền nạp tối thiểu mỗi lần
+
+# ── Cấu hình Chống Spam / Flood ───────────────────────────────────────────────
+FLOOD_RATE_LIMIT_SEC = 0.7   # Khoảng cách tối thiểu giữa 2 thao tác của cùng 1 user
+FLOOD_WARNING_COOLDOWN_SEC = 3  # Chỉ nhắc "thao tác quá nhanh" tối đa 1 lần mỗi khoảng này, tránh spam ngược lại user
 HEARTBEAT_INTERVAL_SEC = 60
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1.5
@@ -99,11 +109,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 MENU_BUTTONS = {
     "🟢 Bot Đang Chạy 24/7", "🏠 Trang Chủ", "🛒 Mua Acc", "💳 Nạp Tiền", "👤 Tài Khoản", "📦 Đơn Hàng", "☎ Hỗ Trợ",
-    "🎁 Giftcode", "📅 Điểm Danh", "🔗 Giới Thiệu", "❓ FAQ",
+    "🎁 Giftcode", "📅 Điểm Danh", "🔗 Giới Thiệu", "❓ FAQ", "💱 Đổi Điểm", "💸 Rút Hoa Hồng",
     "📊 Dashboard", "📥 Import TXT", "📦 Xem Kho", "📊 Thống Kê", "💰 Cộng Tiền", "💸 Trừ Tiền",
     "📷 Đổi QR", "📥 Bill Chờ", "📢 Broadcast", "🚫 Ban User",
     "✅ Unban User", "🗑 Xóa Account", "🧹 Dọn Acc Rác", "📤 Export Chưa Bán", "📤 Export Đã Bán", "🔙 Menu Chính",
-    "🎫 Tạo Giftcode", "🛠 Chế Độ Bảo Trì", "📣 Đặt Banner", "🏆 Top Nạp/Mua",
+    "🎫 Tạo Giftcode", "🛠 Chế Độ Bảo Trì", "📣 Đặt Banner", "🏆 Top Nạp/Mua", "💸 Rút Chờ Duyệt",
 }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -147,6 +157,11 @@ class TaskCode(str, enum.Enum):
     invite_friend = "invite_friend"
     daily_checkin = "daily_checkin"
 
+class WithdrawStatus(str, enum.Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+
 # ── Models ────────────────────────────────────────────────────────────────────
 class User(Base):
     __tablename__ = "users"
@@ -162,6 +177,7 @@ class User(Base):
     points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # telegram_id người giới thiệu
     referral_rewarded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    referral_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # Ví hoa hồng riêng, rút được
     last_checkin_date: Mapped[str | None] = mapped_column(String(10), nullable=True)  # YYYY-MM-DD
     checkin_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     orders: Mapped[list["Order"]] = relationship("Order", back_populates="user")
@@ -250,6 +266,19 @@ class Setting(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+class WithdrawRequest(Base):
+    """Yêu cầu rút hoa hồng giới thiệu ra tiền thật — cần Admin duyệt & chuyển khoản tay."""
+    __tablename__ = "withdraw_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    bank_info: Mapped[str] = mapped_column(String(255), nullable=False)  # Tên NH - STK - Chủ TK
+    status: Mapped[WithdrawStatus] = mapped_column(Enum(WithdrawStatus), nullable=False, default=WithdrawStatus.pending)
+    admin_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    user: Mapped["User"] = relationship("User")
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -275,6 +304,10 @@ async def init_db() -> None:
             pass
         try:
             await conn.execute(sa_text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_rewarded BOOLEAN NOT NULL DEFAULT FALSE"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(sa_text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_balance INTEGER NOT NULL DEFAULT 0"))
         except Exception:
             pass
         try:
@@ -653,12 +686,13 @@ async def get_pending_deposits(session):
 
 
 # ── Điểm thưởng / Điểm danh / Hạng thành viên ────────────────────────────────
-def get_membership_tier(total_spent: int) -> str:
-    tier_name = MEMBERSHIP_TIERS[0][1]
-    for threshold, name in MEMBERSHIP_TIERS:
+def get_membership_tier(total_spent: int):
+    """Trả về (tên hạng, % giảm giá) dựa trên tổng tiền đã mua."""
+    tier_name, discount = MEMBERSHIP_TIERS[0][1], MEMBERSHIP_TIERS[0][2]
+    for threshold, name, disc in MEMBERSHIP_TIERS:
         if total_spent >= threshold:
-            tier_name = name
-    return tier_name
+            tier_name, discount = name, disc
+    return tier_name, discount
 
 async def get_user_total_spent(session, user_id) -> int:
     r = await session.execute(
@@ -680,6 +714,17 @@ async def add_points(session, user_id, amount):
     await session.commit()
     await session.refresh(user)
     return user
+
+async def redeem_points_for_balance(session, user: User, points_to_redeem: int):
+    """Đổi điểm thưởng lấy tiền cộng thẳng vào số dư. Trả về (success, vnd_amount)."""
+    if points_to_redeem <= 0 or points_to_redeem > user.points:
+        return False, 0
+    vnd_amount = points_to_redeem * POINTS_TO_VND_RATE
+    user.points -= points_to_redeem
+    user.balance += vnd_amount
+    await session.commit()
+    await session.refresh(user)
+    return True, vnd_amount
 
 async def do_daily_checkin(session, user):
     """Trả về (success, reward_points, streak) — chặn nếu đã điểm danh hôm nay."""
@@ -713,7 +758,7 @@ async def maybe_reward_referrer(session, bot, deposit_user: User, deposit_amount
     referrer = await get_user_by_telegram_id(session, deposit_user.referred_by)
     if referrer is None:
         return None
-    referrer.balance += REFERRAL_REWARD
+    referrer.referral_balance += REFERRAL_REWARD
     deposit_user.referral_rewarded = True
     await session.commit()
     try:
@@ -722,12 +767,58 @@ async def maybe_reward_referrer(session, bot, deposit_user: User, deposit_amount
             f"🎉 <b>Bạn nhận thưởng giới thiệu!</b>\n\n"
             f"👤 Bạn bè <b>{deposit_user.fullname}</b> vừa nạp tiền lần đầu.\n"
             f"💵 Thưởng: <b>{REFERRAL_REWARD:,} VNĐ</b>\n"
-            f"💰 Số dư mới: <b>{referrer.balance:,} VNĐ</b>",
+            f"💵 Ví hoa hồng hiện có: <b>{referrer.referral_balance:,} VNĐ</b>\n"
+            f"💡 Vào 🔗 Giới Thiệu để rút hoa hồng ra tiền thật.",
             parse_mode="HTML",
         )
     except Exception:
         pass
     return referrer
+
+# ── Rút Hoa Hồng ──────────────────────────────────────────────────────────────
+async def create_withdraw_request(session, user: User, amount, bank_info):
+    if amount <= 0 or amount > user.referral_balance:
+        return None
+    user.referral_balance -= amount  # trừ tạm ngay lúc gửi yêu cầu, tránh rút trùng
+    wr = WithdrawRequest(user_id=user.id, amount=amount, bank_info=bank_info)
+    session.add(wr)
+    await session.commit()
+    await session.refresh(wr)
+    return wr
+
+async def get_withdraw_by_id(session, withdraw_id):
+    r = await session.execute(select(WithdrawRequest).options(selectinload(WithdrawRequest.user)).where(WithdrawRequest.id == withdraw_id))
+    return r.scalar_one_or_none()
+
+async def get_pending_withdraws(session):
+    r = await session.execute(
+        select(WithdrawRequest).options(selectinload(WithdrawRequest.user))
+        .where(WithdrawRequest.status == WithdrawStatus.pending).order_by(WithdrawRequest.created_at.asc())
+    )
+    return list(r.scalars().all())
+
+async def approve_withdraw(session, withdraw_id, admin_tg_id):
+    wr = await get_withdraw_by_id(session, withdraw_id)
+    if wr is None or wr.status != WithdrawStatus.pending: return None
+    wr.status = WithdrawStatus.approved
+    wr.admin_id = admin_tg_id
+    wr.processed_at = datetime.utcnow()
+    await session.commit()
+    await session.refresh(wr)
+    return wr
+
+async def reject_withdraw(session, withdraw_id, admin_tg_id):
+    wr = await get_withdraw_by_id(session, withdraw_id)
+    if wr is None or wr.status != WithdrawStatus.pending: return None
+    wr.status = WithdrawStatus.rejected
+    wr.admin_id = admin_tg_id
+    wr.processed_at = datetime.utcnow()
+    user = await get_user_by_id(session, wr.user_id)
+    if user is not None:
+        user.referral_balance += wr.amount  # hoàn lại ví hoa hồng nếu admin từ chối
+    await session.commit()
+    await session.refresh(wr)
+    return wr
 
 # ── Giftcode ──────────────────────────────────────────────────────────────────
 def _generate_code(prefix="GIFT", length=8):
@@ -876,7 +967,8 @@ def main_menu_kb():
     b.row(KeyboardButton(text="🛒 Mua Acc"), KeyboardButton(text="💳 Nạp Tiền"))
     b.row(KeyboardButton(text="👤 Tài Khoản"), KeyboardButton(text="📦 Đơn Hàng"))
     b.row(KeyboardButton(text="🎁 Giftcode"), KeyboardButton(text="📅 Điểm Danh"))
-    b.row(KeyboardButton(text="🔗 Giới Thiệu"), KeyboardButton(text="❓ FAQ"))
+    b.row(KeyboardButton(text="🔗 Giới Thiệu"), KeyboardButton(text="💱 Đổi Điểm"))
+    b.row(KeyboardButton(text="💸 Rút Hoa Hồng"), KeyboardButton(text="❓ FAQ"))
     b.row(KeyboardButton(text="☎ Hỗ Trợ"), KeyboardButton(text="🏠 Trang Chủ"))
     b.row(KeyboardButton(text="🟢 Bot Đang Chạy 24/7"))
     return b.as_markup(resize_keyboard=True)
@@ -899,6 +991,14 @@ def deposit_approval_kb(deposit_id):
     )
     return b.as_markup()
 
+def withdraw_approval_kb(withdraw_id):
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ ĐÃ CHUYỂN", callback_data=f"approve_withdraw:{withdraw_id}"),
+        InlineKeyboardButton(text="❌ TỪ CHỐI", callback_data=f"reject_withdraw:{withdraw_id}"),
+    )
+    return b.as_markup()
+
 def admin_menu_kb():
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text="📊 Dashboard"), KeyboardButton(text="🏆 Top Nạp/Mua"))
@@ -906,6 +1006,7 @@ def admin_menu_kb():
     b.row(KeyboardButton(text="📊 Thống Kê"), KeyboardButton(text="🎫 Tạo Giftcode"))
     b.row(KeyboardButton(text="💰 Cộng Tiền"), KeyboardButton(text="💸 Trừ Tiền"))
     b.row(KeyboardButton(text="📷 Đổi QR"), KeyboardButton(text="📥 Bill Chờ"))
+    b.row(KeyboardButton(text="💸 Rút Chờ Duyệt"))
     b.row(KeyboardButton(text="📢 Broadcast"), KeyboardButton(text="📣 Đặt Banner"))
     b.row(KeyboardButton(text="🚫 Ban User"), KeyboardButton(text="✅ Unban User"))
     b.row(KeyboardButton(text="🗑 Xóa Account"), KeyboardButton(text="🧹 Dọn Acc Rác"))
@@ -915,6 +1016,38 @@ def admin_menu_kb():
     return b.as_markup(resize_keyboard=True)
 
 # ── Middleware ────────────────────────────────────────────────────────────────
+class ThrottlingMiddleware(BaseMiddleware):
+    """Chống spam/flood: chặn user bấm/gửi liên tục quá nhanh, tránh lỗi trùng đơn hàng, trùng yêu cầu.
+    Admin không bị giới hạn để tiện xử lý duyệt đơn hàng loạt."""
+    def __init__(self, rate_limit_sec: float = FLOOD_RATE_LIMIT_SEC):
+        self.rate_limit_sec = rate_limit_sec
+        self._last_call: dict[int, float] = {}
+        self._last_warned: dict[int, float] = {}
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is None or user.id in ADMIN_IDS:
+            return await handler(event, data)
+
+        now = time.monotonic()
+        last = self._last_call.get(user.id, 0.0)
+        if now - last < self.rate_limit_sec:
+            # Bị chặn do thao tác quá nhanh — chỉ cảnh báo cách quãng, không trả lời từng lần để tránh spam ngược
+            last_warned = self._last_warned.get(user.id, 0.0)
+            if now - last_warned > FLOOD_WARNING_COOLDOWN_SEC:
+                self._last_warned[user.id] = now
+                try:
+                    if isinstance(event, Message):
+                        await event.answer("⏳ Bạn đang thao tác quá nhanh, vui lòng chờ một chút rồi thử lại.")
+                    elif isinstance(event, CallbackQuery):
+                        await event.answer("⏳ Thao tác quá nhanh, vui lòng chờ chút!", show_alert=False)
+                except Exception:
+                    pass
+            return  # Bỏ qua update này, không đưa vào handler
+
+        self._last_call[user.id] = now
+        return await handler(event, data)
+
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
@@ -962,6 +1095,13 @@ class DepositState(StatesGroup):
 
 class GiftState(StatesGroup):
     waiting_code = State()
+
+class PointsState(StatesGroup):
+    waiting_amount = State()
+
+class WithdrawState(StatesGroup):
+    waiting_amount = State()
+    waiting_bank_info = State()
 
 class AdminStates(StatesGroup):
     waiting_qr = State()
@@ -1104,7 +1244,9 @@ async def referral_page(message: Message, state: FSMContext, db_user: User, db_s
         f"📊 <b>Thống kê giới thiệu:</b>\n"
         f"👥 Đã mời: <b>{stats['total_invited']}</b> người\n"
         f"✅ Đã nạp & nhận thưởng: <b>{stats['rewarded']}</b> người\n"
-        f"💰 Tổng thưởng đã nhận: <b>{stats['total_earned']:,} VNĐ</b>",
+        f"💰 Tổng thưởng đã nhận: <b>{stats['total_earned']:,} VNĐ</b>\n\n"
+        f"💵 Ví hoa hồng hiện có: <b>{db_user.referral_balance:,} VNĐ</b>\n"
+        f"💡 Bấm 💸 <b>Rút Hoa Hồng</b> để rút ra tiền thật (tối thiểu {MIN_WITHDRAW_COMMISSION:,} VNĐ).",
         parse_mode="HTML",
     )
 
@@ -1125,6 +1267,192 @@ async def faq_page(message: Message, state: FSMContext):
         "☎️ Cần hỗ trợ thêm? Bấm <b>Hỗ Trợ</b> để liên hệ Admin.",
         parse_mode="HTML",
     )
+
+# ── Đổi Điểm Lấy Tiền ─────────────────────────────────────────────────────────
+@router.message(lambda m: m.text == "💱 Đổi Điểm")
+async def points_redeem_start(message: Message, state: FSMContext, db_user: User):
+    await state.clear()
+    if db_user.points < MIN_POINTS_REDEEM:
+        await message.answer(
+            f"💱 <b>Đổi Điểm Lấy Tiền</b>\n\n"
+            f"⭐ Điểm hiện có: <b>{db_user.points:,} điểm</b>\n"
+            f"📊 Tỷ lệ: <b>1 điểm = {POINTS_TO_VND_RATE} VNĐ</b>\n"
+            f"⚠️ Cần tối thiểu <b>{MIN_POINTS_REDEEM:,} điểm</b> để đổi. Bạn chưa đủ điểm.",
+            parse_mode="HTML",
+        )
+        return
+    await message.answer(
+        f"💱 <b>Đổi Điểm Lấy Tiền</b>\n\n"
+        f"⭐ Điểm hiện có: <b>{db_user.points:,} điểm</b>\n"
+        f"📊 Tỷ lệ: <b>1 điểm = {POINTS_TO_VND_RATE} VNĐ</b>\n\n"
+        f"Nhập số điểm muốn đổi (tối thiểu {MIN_POINTS_REDEEM:,}):",
+        parse_mode="HTML", reply_markup=cancel_kb()
+    )
+    await state.set_state(PointsState.waiting_amount)
+
+@router.message(PointsState.waiting_amount, lambda m: m.text == "❌ Hủy")
+async def points_redeem_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Đã hủy đổi điểm.", reply_markup=main_menu_kb())
+
+@router.message(PointsState.waiting_amount)
+async def points_redeem_submit(message: Message, state: FSMContext, db_user: User, db_session):
+    text = (message.text or "").replace(",", "").strip()
+    await state.clear()
+    if not text.isdigit() or int(text) < MIN_POINTS_REDEEM:
+        await message.answer(f"⚠️ Vui lòng nhập số điểm hợp lệ (tối thiểu {MIN_POINTS_REDEEM:,}).", reply_markup=main_menu_kb())
+        return
+    points_to_redeem = int(text)
+    ok, vnd_amount = await redeem_points_for_balance(db_session, db_user, points_to_redeem)
+    if not ok:
+        await message.answer("⚠️ Bạn không đủ điểm để đổi số lượng này.", reply_markup=main_menu_kb())
+        return
+    await message.answer(
+        f"✅ <b>Đổi Điểm Thành Công!</b>\n\n"
+        f"💱 Đã đổi: <b>{points_to_redeem:,} điểm</b> → <b>{vnd_amount:,} VNĐ</b>\n"
+        f"💰 Số dư mới: <b>{db_user.balance:,} VNĐ</b>\n"
+        f"⭐ Điểm còn lại: <b>{db_user.points:,} điểm</b>",
+        parse_mode="HTML", reply_markup=main_menu_kb()
+    )
+
+# ── Rút Hoa Hồng Giới Thiệu ───────────────────────────────────────────────────
+@router.message(lambda m: m.text == "💸 Rút Hoa Hồng")
+async def withdraw_start(message: Message, state: FSMContext, db_user: User):
+    await state.clear()
+    if db_user.referral_balance < MIN_WITHDRAW_COMMISSION:
+        await message.answer(
+            f"💸 <b>Rút Hoa Hồng</b>\n\n"
+            f"💵 Ví hoa hồng hiện có: <b>{db_user.referral_balance:,} VNĐ</b>\n"
+            f"⚠️ Cần tối thiểu <b>{MIN_WITHDRAW_COMMISSION:,} VNĐ</b> để rút. Bạn chưa đủ.",
+            parse_mode="HTML",
+        )
+        return
+    await message.answer(
+        f"💸 <b>Rút Hoa Hồng</b>\n\n"
+        f"💵 Ví hoa hồng hiện có: <b>{db_user.referral_balance:,} VNĐ</b>\n\n"
+        f"Nhập số tiền muốn rút (tối thiểu {MIN_WITHDRAW_COMMISSION:,} VNĐ):",
+        parse_mode="HTML", reply_markup=cancel_kb()
+    )
+    await state.set_state(WithdrawState.waiting_amount)
+
+@router.message(WithdrawState.waiting_amount, lambda m: m.text == "❌ Hủy")
+async def withdraw_cancel_amount(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Đã hủy yêu cầu rút hoa hồng.", reply_markup=main_menu_kb())
+
+@router.message(WithdrawState.waiting_amount)
+async def withdraw_amount(message: Message, state: FSMContext, db_user: User):
+    text = (message.text or "").replace(",", "").strip()
+    if not text.isdigit() or int(text) < MIN_WITHDRAW_COMMISSION or int(text) > db_user.referral_balance:
+        await message.answer(f"⚠️ Số tiền không hợp lệ (tối thiểu {MIN_WITHDRAW_COMMISSION:,} VNĐ, tối đa số dư ví hoa hồng).")
+        return
+    await state.update_data(withdraw_amount=int(text))
+    await message.answer(
+        "🏦 Nhập thông tin nhận tiền theo định dạng:\n<code>Ngân hàng - Số tài khoản - Tên chủ TK</code>\n\n"
+        "Ví dụ: <code>MB Bank - 0123456789 - NGUYEN VAN A</code>",
+        parse_mode="HTML",
+    )
+    await state.set_state(WithdrawState.waiting_bank_info)
+
+@router.message(WithdrawState.waiting_bank_info, lambda m: m.text == "❌ Hủy")
+async def withdraw_cancel_bank(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Đã hủy yêu cầu rút hoa hồng.", reply_markup=main_menu_kb())
+
+@router.message(WithdrawState.waiting_bank_info)
+async def withdraw_bank_info(message: Message, state: FSMContext, bot: Bot, db_user: User, db_session):
+    bank_info = (message.text or "").strip()
+    data = await state.get_data()
+    amount = data.get("withdraw_amount", 0)
+    await state.clear()
+    if len(bank_info) < 5:
+        await message.answer("⚠️ Thông tin ngân hàng không hợp lệ, vui lòng thử lại từ đầu.", reply_markup=main_menu_kb())
+        return
+
+    wr = await create_withdraw_request(db_session, db_user, amount, bank_info)
+    if wr is None:
+        await message.answer("⚠️ Không đủ số dư ví hoa hồng để tạo yêu cầu này.", reply_markup=main_menu_kb())
+        return
+
+    uname = f"@{db_user.username}" if db_user.username else "Không có"
+    caption = (
+        f"💸 <b>YÊU CẦU RÚT HOA HỒNG #{wr.id}</b>\n\n"
+        f"🆔 ID: <code>{db_user.telegram_id}</code>\n"
+        f"👤 {uname} — {db_user.fullname}\n"
+        f"💵 Số tiền: <b>{amount:,} VNĐ</b>\n"
+        f"🏦 Nhận tại: {bank_info}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, caption, parse_mode="HTML", reply_markup=withdraw_approval_kb(wr.id))
+        except Exception:
+            pass
+    await message.answer(
+        f"✅ <b>Đã gửi yêu cầu rút hoa hồng!</b>\n\n"
+        f"💵 Số tiền: <b>{amount:,} VNĐ</b>\n"
+        f"⏳ Vui lòng đợi Admin xác nhận và chuyển khoản trong thời gian sớm nhất.",
+        parse_mode="HTML", reply_markup=main_menu_kb()
+    )
+
+@router.callback_query(F.data.startswith("approve_withdraw:"))
+async def cb_approve_withdraw(callback: CallbackQuery, bot: Bot, is_admin: bool, db_session):
+    if not is_admin:
+        await callback.answer("Bạn không có quyền!", show_alert=True); return
+    withdraw_id = int(callback.data.split(":")[1])
+    wr = await approve_withdraw(db_session, withdraw_id, callback.from_user.id)
+    if wr is None:
+        await callback.answer("Yêu cầu không tồn tại hoặc đã xử lý!", show_alert=True); return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(f"✅ Đã xác nhận chuyển khoản <b>{wr.amount:,} VNĐ</b> cho yêu cầu #{withdraw_id}", parse_mode="HTML")
+    if wr.user:
+        try:
+            await bot.send_message(
+                wr.user.telegram_id,
+                f"✅ <b>Yêu cầu rút hoa hồng #{withdraw_id} đã được chuyển khoản!</b>\n\n💵 Số tiền: <b>{wr.amount:,} VNĐ</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    await callback.answer("✅ Hoàn tất!")
+
+@router.callback_query(F.data.startswith("reject_withdraw:"))
+async def cb_reject_withdraw(callback: CallbackQuery, bot: Bot, is_admin: bool, db_session):
+    if not is_admin:
+        await callback.answer("Bạn không có quyền!", show_alert=True); return
+    withdraw_id = int(callback.data.split(":")[1])
+    wr = await reject_withdraw(db_session, withdraw_id, callback.from_user.id)
+    if wr is None:
+        await callback.answer("Yêu cầu không tồn tại hoặc đã xử lý!", show_alert=True); return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(f"❌ Đã từ chối yêu cầu rút #{withdraw_id}, đã hoàn lại ví hoa hồng cho khách.", parse_mode="HTML")
+    if wr.user:
+        try:
+            await bot.send_message(
+                wr.user.telegram_id,
+                f"❌ <b>Yêu cầu rút hoa hồng #{withdraw_id} bị từ chối.</b>\n\n💵 Đã hoàn lại <b>{wr.amount:,} VNĐ</b> vào ví hoa hồng. Liên hệ Admin để biết thêm chi tiết.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    await callback.answer("Đã từ chối!")
+
+@router.message(lambda m: m.text == "💸 Rút Chờ Duyệt")
+@admin_only
+async def admin_pending_withdraws(message: Message, is_admin: bool, db_session):
+    withdraws = await get_pending_withdraws(db_session)
+    if not withdraws:
+        await message.answer("✅ Không có yêu cầu rút hoa hồng nào đang chờ.")
+        return
+    for wr in withdraws[:20]:
+        uname = f"@{wr.user.username}" if wr.user and wr.user.username else "Không có"
+        caption = (
+            f"💸 <b>YÊU CẦU RÚT #{wr.id}</b>\n\n"
+            f"🆔 ID: <code>{wr.user.telegram_id if wr.user else '?'}</code>\n"
+            f"👤 {uname} — {wr.user.fullname if wr.user else '?'}\n"
+            f"💵 Số tiền: <b>{wr.amount:,} VNĐ</b>\n"
+            f"🏦 Nhận tại: {wr.bank_info}"
+        )
+        await message.answer(caption, parse_mode="HTML", reply_markup=withdraw_approval_kb(wr.id))
 
 @router.message(lambda m: m.text == "☎ Hỗ Trợ")
 async def support(message: Message, state: FSMContext):
@@ -1168,7 +1496,10 @@ async def buy_acc_quantity(message: Message, state: FSMContext, db_user: User, d
     if quantity < MIN_ORDER_QTY:
         await message.answer(f"⚠️ Số lượng tối thiểu là <b>{MIN_ORDER_QTY} acc</b>.", parse_mode="HTML")
         return
-    total_price = quantity * ACCOUNT_PRICE
+    base_price = quantity * ACCOUNT_PRICE
+    total_spent_so_far = await get_user_total_spent(db_session, db_user.id)
+    tier_name, discount_pct = get_membership_tier(total_spent_so_far)
+    total_price = base_price - (base_price * discount_pct // 100)
 
     r_u = await db_session.execute(select(User).where(User.id == db_user.id).with_for_update())
     fresh_user = r_u.scalar_one_or_none()
@@ -1230,7 +1561,8 @@ async def buy_acc_quantity(message: Message, state: FSMContext, db_user: User, d
     await message.answer(
         f"✅ <b>Mua hàng thành công!</b>\n\n"
         f"📦 Số lượng: <b>{quantity} acc</b>\n"
-        f"💵 Tổng tiền: <b>{total_price:,} VNĐ</b>\n"
+        + (f"🏷 Giá gốc: <s>{base_price:,} VNĐ</s> — {tier_name} giảm {discount_pct}%\n" if discount_pct else "")
+        + f"💵 Tổng tiền: <b>{total_price:,} VNĐ</b>\n"
         f"🧾 Mã đơn: <b>#{order.id}</b>\n\nĐang gửi file...",
         parse_mode="HTML", reply_markup=main_menu_kb()
     )
@@ -1246,7 +1578,7 @@ async def my_account(message: Message, state: FSMContext, db_user: User, db_sess
     uname = f"@{db_user.username}" if db_user.username else "Không có"
     total_spent = await get_user_total_spent(db_session, db_user.id)
     total_deposited = await get_user_total_deposited(db_session, db_user.id)
-    tier = get_membership_tier(total_spent)
+    tier, discount = get_membership_tier(total_spent)
     await message.answer(
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>HỒ SƠ CỦA TÔI</b>\n"
@@ -1255,7 +1587,7 @@ async def my_account(message: Message, state: FSMContext, db_user: User, db_sess
         f"👤 Username: {uname}\n"
         f"📛 Tên: {db_user.fullname}\n"
         f"📅 Tham gia ngày: {joined}\n"
-        f"{tier} Hạng thành viên\n"
+        f"{tier} Hạng thành viên" + (f" (giảm {discount}% khi mua acc)" if discount else "") + "\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 Số dư: <b>{db_user.balance:,} VNĐ</b>\n"
         f"💳 Tổng đã nạp: <b>{total_deposited:,} VNĐ</b>\n"
@@ -1263,6 +1595,7 @@ async def my_account(message: Message, state: FSMContext, db_user: User, db_sess
         f"📦 Số đơn: <b>{len(orders)}</b>\n"
         f"⭐ Điểm thưởng: <b>{db_user.points:,} điểm</b>\n"
         f"🔥 Chuỗi điểm danh: <b>{db_user.checkin_streak} ngày</b>\n"
+        f"💵 Ví hoa hồng: <b>{db_user.referral_balance:,} VNĐ</b>\n"
         f"━━━━━━━━━━━━━━━━━━",
         parse_mode="HTML",
     )
@@ -1290,7 +1623,7 @@ async def deposit_start(message: Message, state: FSMContext):
     if not sepay_enabled() and not qr_exists():
         await message.answer("⚠️ Hệ thống nạp tiền đang bảo trì (Thiếu QR). Vui lòng liên hệ Admin.")
         return
-    await message.answer("💳 <b>Nạp Tiền</b>\n\nNhập số tiền muốn nạp (tối thiểu 10,000VNĐ):", parse_mode="HTML", reply_markup=cancel_kb())
+    await message.answer(f"💳 <b>Nạp Tiền</b>\n\nNhập số tiền muốn nạp (tối thiểu {MIN_DEPOSIT_AMOUNT:,} VNĐ):", parse_mode="HTML", reply_markup=cancel_kb())
     await state.set_state(DepositState.waiting_amount)
 
 @router.message(DepositState.waiting_amount, F.text == "❌ Hủy")
@@ -1301,8 +1634,8 @@ async def deposit_cancel_amount(message: Message, state: FSMContext):
 @router.message(DepositState.waiting_amount, ~F.text.in_(MENU_BUTTONS))
 async def deposit_amount(message: Message, state: FSMContext, db_user: User, db_session):
     text = (message.text or "").replace(",", "").replace(".", "").strip()
-    if not text.isdigit() or int(text) <= 0:
-        await message.answer("⚠️ Vui lòng nhập số tiền hợp lệ.")
+    if not text.isdigit() or int(text) < MIN_DEPOSIT_AMOUNT:
+        await message.answer(f"⚠️ Vui lòng nhập số tiền hợp lệ (tối thiểu {MIN_DEPOSIT_AMOUNT:,} VNĐ).")
         return
     amount = int(text)
 
@@ -1925,6 +2258,8 @@ async def main():
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.message.middleware(ThrottlingMiddleware())
+    dp.callback_query.middleware(ThrottlingMiddleware())
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
     dp.include_router(router)
