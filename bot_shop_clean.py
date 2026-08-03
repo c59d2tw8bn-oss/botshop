@@ -72,7 +72,7 @@ CHECKIN_STREAK_BONUS = 100    # điểm cộng thêm mỗi ngày giữ streak (t
 REFERRAL_REWARD = 3000        # VNĐ thưởng cho người mời khi giới thiệu nạp tiền lần đầu
 REFERRAL_MIN_DEPOSIT = 20000  # Số tiền nạp tối thiểu lần đầu để tính thưởng giới thiệu
 POINTS_PER_VND_SPENT = 1      # số điểm nhận được trên mỗi 1.000 VNĐ chi tiêu (mua acc)
-POINTS_TO_VND_RATE = 1        # 100 điểm = 1 VNĐ khi đổi điểm lấy tiền
+POINTS_PER_VND = 10           # Cứ 10 điểm đổi được 1 VNĐ (10 điểm = 1 VNĐ)
 MIN_POINTS_REDEEM = 1000      # số điểm tối thiểu để đổi ra tiền
 MEMBERSHIP_TIERS = [
     # (ngưỡng tổng tiền đã mua, tên hạng, % giảm giá khi mua acc)
@@ -716,11 +716,14 @@ async def add_points(session, user_id, amount):
     return user
 
 async def redeem_points_for_balance(session, user: User, points_to_redeem: int):
-    """Đổi điểm thưởng lấy tiền cộng thẳng vào số dư. Trả về (success, vnd_amount)."""
+    """Đổi điểm thưởng lấy tiền cộng thẳng vào số dư (10 điểm = 1 VNĐ). Trả về (success, vnd_amount)."""
     if points_to_redeem <= 0 or points_to_redeem > user.points:
         return False, 0
-    vnd_amount = points_to_redeem * POINTS_TO_VND_RATE
-    user.points -= points_to_redeem
+    vnd_amount = points_to_redeem // POINTS_PER_VND
+    if vnd_amount <= 0:
+        return False, 0
+    points_used = vnd_amount * POINTS_PER_VND  # chỉ trừ đúng số điểm quy đổi tròn, phần dư giữ lại cho user
+    user.points -= points_used
     user.balance += vnd_amount
     await session.commit()
     await session.refresh(user)
@@ -1276,7 +1279,7 @@ async def points_redeem_start(message: Message, state: FSMContext, db_user: User
         await message.answer(
             f"💱 <b>Đổi Điểm Lấy Tiền</b>\n\n"
             f"⭐ Điểm hiện có: <b>{db_user.points:,} điểm</b>\n"
-            f"📊 Tỷ lệ: <b>1 điểm = {POINTS_TO_VND_RATE} VNĐ</b>\n"
+            f"📊 Tỷ lệ: <b>{POINTS_PER_VND} điểm = 1 VNĐ</b>\n"
             f"⚠️ Cần tối thiểu <b>{MIN_POINTS_REDEEM:,} điểm</b> để đổi. Bạn chưa đủ điểm.",
             parse_mode="HTML",
         )
@@ -1284,7 +1287,7 @@ async def points_redeem_start(message: Message, state: FSMContext, db_user: User
     await message.answer(
         f"💱 <b>Đổi Điểm Lấy Tiền</b>\n\n"
         f"⭐ Điểm hiện có: <b>{db_user.points:,} điểm</b>\n"
-        f"📊 Tỷ lệ: <b>1 điểm = {POINTS_TO_VND_RATE} VNĐ</b>\n\n"
+        f"📊 Tỷ lệ: <b>{POINTS_PER_VND} điểm = 1 VNĐ</b>\n\n"
         f"Nhập số điểm muốn đổi (tối thiểu {MIN_POINTS_REDEEM:,}):",
         parse_mode="HTML", reply_markup=cancel_kb()
     )
